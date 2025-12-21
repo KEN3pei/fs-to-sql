@@ -17,7 +17,7 @@ type File struct {
 }
 
 // どうやってtebleスキーマ生成する？
-func (f *File) ToColumn() []string {
+func (f File) ToColumn() []string {
 	// dir構造体をDDLに変換したい
 	// path,perm,parent_path,owner,group,size,updated_at,name
 	return []string{

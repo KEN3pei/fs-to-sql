@@ -18,7 +18,7 @@ type Dir struct {
 }
 
 // どうやってtebleスキーマ生成する？
-func (d *Dir) ToColumn() []string {
+func (d Dir) ToColumn() []string {
 	// dir構造体をDDLに変換したい
 	// path,perm,parent_path,owner,group,size,updated_at,name
 	return []string{
