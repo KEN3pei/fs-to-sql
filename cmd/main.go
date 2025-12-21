@@ -49,6 +49,10 @@ func main() {
 	processedCount := 0
 	errorCount := 0
 
+	// syscallを減らすためのキャッシュを定義
+	userCache := make(map[uint32]string)
+	groupCache := make(map[uint32]string)
+
 	filepath.WalkDir(home, func(path string, info fs.DirEntry, err error) error {
 		if err != nil {
 			errorCount++
@@ -72,17 +76,26 @@ func main() {
 		if stat, ok := fileInfo.Sys().(*syscall.Stat_t); ok {
 			uid := stat.Uid
 			gid := stat.Gid
-			// ユーザー名を取得
-			u, userErr := user.LookupId(strconv.Itoa(int(uid)))
-			userName = strconv.Itoa(int(uid)) // デフォルトはUID
-			if userErr == nil {
-				userName = u.Username
+			// usernameを取得(キャッシュ使用)
+			if cachedName, ok := userCache[uid]; ok {
+				userName = cachedName
+			} else {
+				u, err := user.LookupId(strconv.Itoa(int(uid)))
+				if err == nil {
+					userName = u.Username
+					userCache[uid] = userName
+				}
 			}
-			// グループ名を取得
-			g, groupErr := user.LookupGroupId(strconv.Itoa(int(gid)))
-			groupName = strconv.Itoa(int(gid)) // デフォルトはGID
-			if groupErr == nil {
-				groupName = g.Name
+			// グループ名を取得(キャッシュ使用)
+			if cachedGroupName, ok := groupCache[gid]; ok {
+				groupName = cachedGroupName
+			} else {
+				g, err := user.LookupGroupId(strconv.Itoa(int(gid)))
+				groupName = strconv.Itoa(int(gid)) // デフォルトはGID
+				if err == nil {
+					groupName = g.Name
+				}
+				groupCache[gid] = groupName // 成功・失敗に関わらずキャッシュ
 			}
 		}
 
