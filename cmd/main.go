@@ -6,10 +6,12 @@ import (
 	"fssync_db/internal/dir"
 	"fssync_db/internal/file"
 	"io/fs"
+	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -42,106 +44,142 @@ func main() {
 	filesWriter.WriteString(db.GetFileInsertHeader())
 	dirsWriter.WriteString(db.GetDirInsertHeader())
 
+	type Job struct {
+		data db.Schema
+	}
+
+	// job worker起動
+	jobs := make(chan Job, 10)
+
 	// 最初のエントリかどうかを追跡するフラグ
 	isFirstFile := true
 	isFirstDir := true
 
+	// ワーカーを先に起動
 	processedCount := 0
-	errorCount := 0
+	go func() {
+		for job := range jobs { // jobs が閉じるまでループ
+			if dir, ok := job.data.(dir.Dir); ok {
+				// バルクINSERTの値部分を書き込み
+				if isFirstDir {
+					dirsWriter.WriteString(db.DirToFirstBulkValue(dir))
+					isFirstDir = false
+				} else {
+					dirsWriter.WriteString(db.DirToBulkValue(dir))
+				}
+			}
+			if file, ok := job.data.(file.File); ok {
+				// バルクINSERTの値部分を書き込み
+				if isFirstFile {
+					filesWriter.WriteString(db.FileToFirstBulkValue(file))
+					isFirstFile = false
+				} else {
+					filesWriter.WriteString(db.FileToBulkValue(file))
+				}
+			}
+			processedCount++
+		}
+	}()
 
+	errorCount := 0
 	// syscallを減らすためのキャッシュを定義
 	userCache := make(map[uint32]string)
 	groupCache := make(map[uint32]string)
 
+	// WaitGroupで全てのgoroutineの完了を待つ
+	var wg sync.WaitGroup
+
 	filepath.WalkDir(home, func(path string, info fs.DirEntry, err error) error {
-		if err != nil {
-			errorCount++
-			// エラーの詳細を出力（最初の10個まで）
-			if errorCount <= 10 {
-				println("エラー:", path, "->", err.Error())
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err != nil {
+				errorCount++
+				// エラーの詳細を出力（最初の10個まで）
+				if errorCount <= 10 {
+					println("エラー:", path, "->", err.Error())
+				}
+				// 権限エラーなどは無視して続行
+				return
 			}
-			// 権限エラーなどは無視して続行
-			return nil
-		}
 
-		fileInfo, infoErr := info.Info()
-		if infoErr != nil {
-			return infoErr
-		}
+			fileInfo, infoErr := info.Info()
+			if infoErr != nil {
+				log.Fatal(infoErr.Error())
+				return
+			}
 
-		// owner/group情報を取得
-		// Windows以外でのみ動作する
-		var userName string
-		var groupName string
-		if stat, ok := fileInfo.Sys().(*syscall.Stat_t); ok {
-			uid := stat.Uid
-			gid := stat.Gid
-			// usernameを取得(キャッシュ使用)
-			if cachedName, ok := userCache[uid]; ok {
-				userName = cachedName
-			} else {
-				u, err := user.LookupId(strconv.Itoa(int(uid)))
-				if err == nil {
-					userName = u.Username
-					userCache[uid] = userName
+			// owner/group情報を取得
+			// Windows以外でのみ動作する
+			var userName string
+			var groupName string
+			if stat, ok := fileInfo.Sys().(*syscall.Stat_t); ok {
+				uid := stat.Uid
+				gid := stat.Gid
+				// usernameを取得(キャッシュ使用)
+				if cachedName, ok := userCache[uid]; ok {
+					userName = cachedName
+				} else {
+					u, err := user.LookupId(strconv.Itoa(int(uid)))
+					if err == nil {
+						userName = u.Username
+						userCache[uid] = userName
+					}
+				}
+				// グループ名を取得(キャッシュ使用)
+				if cachedGroupName, ok := groupCache[gid]; ok {
+					groupName = cachedGroupName
+				} else {
+					g, err := user.LookupGroupId(strconv.Itoa(int(gid)))
+					groupName = strconv.Itoa(int(gid)) // デフォルトはGID
+					if err == nil {
+						groupName = g.Name
+					}
+					groupCache[gid] = groupName // 成功・失敗に関わらずキャッシュ
 				}
 			}
-			// グループ名を取得(キャッシュ使用)
-			if cachedGroupName, ok := groupCache[gid]; ok {
-				groupName = cachedGroupName
-			} else {
-				g, err := user.LookupGroupId(strconv.Itoa(int(gid)))
-				groupName = strconv.Itoa(int(gid)) // デフォルトはGID
-				if err == nil {
-					groupName = g.Name
+
+			parentPath := filepath.Dir(path)
+
+			// dならDir構造体作成 & バルクINSERTの値部分を書き込み
+			// それ以外ならFile構造体作成 & バルクINSERTの値部分を書き込み
+			if info.IsDir() {
+				newDir := dir.Dir{
+					Path:    path,
+					Perm:    fileInfo.Mode(),
+					Parent:  parentPath,
+					Owner:   userName,
+					Group:   groupName,
+					Size:    fileInfo.Size(),
+					Updated: fileInfo.ModTime().Format(time.RFC3339),
+					Name:    fileInfo.Name(),
 				}
-				groupCache[gid] = groupName // 成功・失敗に関わらずキャッシュ
-			}
-		}
-
-		parentPath := filepath.Dir(path)
-
-		// dならDir構造体作成 & バルクINSERTの値部分を書き込み
-		// それ以外ならFile構造体作成 & バルクINSERTの値部分を書き込み
-		if info.IsDir() {
-			newDir := dir.Dir{
-				Path:    path,
-				Perm:    fileInfo.Mode(),
-				Parent:  parentPath,
-				Owner:   userName,
-				Group:   groupName,
-				Size:    fileInfo.Size(),
-				Updated: fileInfo.ModTime().Format(time.RFC3339),
-				Name:    fileInfo.Name(),
-			}
-			// バルクINSERTの値部分を書き込み
-			if isFirstDir {
-				dirsWriter.WriteString(db.DirToFirstBulkValue(newDir))
-				isFirstDir = false
+				jobs <- Job{
+					data: newDir,
+				}
 			} else {
-				dirsWriter.WriteString(db.DirToBulkValue(newDir))
+				newFile := file.File{
+					Perm:    fileInfo.Mode(),
+					Parent:  parentPath,
+					Owner:   userName,
+					Group:   groupName,
+					Size:    fileInfo.Size(),
+					Updated: fileInfo.ModTime().Format(time.RFC3339),
+					Name:    fileInfo.Name(),
+				}
+				jobs <- Job{
+					data: newFile,
+				}
 			}
-		} else {
-			newFile := file.File{
-				Perm:    fileInfo.Mode(),
-				Parent:  parentPath,
-				Owner:   userName,
-				Group:   groupName,
-				Size:    fileInfo.Size(),
-				Updated: fileInfo.ModTime().Format(time.RFC3339),
-				Name:    fileInfo.Name(),
-			}
-			// バルクINSERTの値部分を書き込み
-			if isFirstFile {
-				filesWriter.WriteString(db.FileToFirstBulkValue(newFile))
-				isFirstFile = false
-			} else {
-				filesWriter.WriteString(db.FileToBulkValue(newFile))
-			}
-		}
-		processedCount++
+		}()
 		return nil
 	})
+
+	// 全てのgoroutineが完了するのを待つ
+	wg.Wait()
+
+	// jobs channelをclose(バッファに残った処理の完了後終了)
+	close(jobs)
 
 	// 処理結果を出力
 	println("処理されたファイル・ディレクトリ数:", processedCount)

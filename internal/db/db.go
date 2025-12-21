@@ -45,3 +45,7 @@ func DirToBulkValue(d dir.Dir) string {
 func FileToBulkValue(f file.File) string {
 	return fmt.Sprintf(",\n(%s)", strings.Join(f.ToColumn(), ","))
 }
+
+type Schema interface {
+	ToColumn() []string
+}
